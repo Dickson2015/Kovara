@@ -32,6 +32,7 @@ pub enum StorageKey {
     Proposal(u64),              // persistent: proposal_id -> Proposal
     RewardBalance(RewardRole, Address, Address), // persistent: (role, user, token) -> i128
     RewardLiability(Address),  // persistent: token -> total unclaimed rewards
+    RewardAssets,              // persistent: configured XLM + USDC reward asset addresses
     Admin,                     // persistent or instance admin reference
     Verifier(Address),          // persistent: registered verifier marker
     VerifierStake(Address, Address), // persistent: (verifier, token) -> i128
@@ -192,6 +193,15 @@ pub struct Pool {
     pub balance: i128,
     pub admins: Vec<Address>,
     pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewardAssetConfig {
+    /// Stellar XLM asset identifier for the active network.
+    pub xlm: Address,
+    /// Stellar USDC asset identifier for the active network.
+    pub usdc: Address,
 }
 
 #[contracttype]
