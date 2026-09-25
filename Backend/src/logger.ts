@@ -219,6 +219,49 @@ export interface Logger {
   child(bindings: LoggerBindings): Logger;
 }
 
+/**
+ * Side-effect hook invoked for every `error()` line (#683).
+ *
+ * This is how alerting attaches to the existing call sites: the indexer already
+ * reports genuine production failures through `logger.error`, so routing those
+ * lines to an alert sink gives coverage of every current and future error site
+ * without editing each one. The hook is optional and additive — with none
+ * installed the logger behaves exactly as before.
+ *
+ * A hook that throws is ignored: alerting must never break logging.
+ */
+export type ErrorHook = (
+  message: string,
+  args: unknown[],
+  bindings: LoggerBindings
+) => void;
+
+let errorHook: ErrorHook | undefined;
+
+/**
+ * Install (or, with `undefined`, remove) the process-wide error hook.
+ *
+ * Only one hook is supported; installing a second replaces the first, which
+ * keeps ownership unambiguous and prevents two subsystems from silently
+ * double-reporting the same failure.
+ */
+export function setErrorHook(hook: ErrorHook | undefined): void {
+  errorHook = hook;
+}
+
+function runErrorHook(
+  message: string,
+  args: unknown[],
+  bindings: LoggerBindings
+): void {
+  if (!errorHook) return;
+  try {
+    errorHook(message, args, bindings);
+  } catch {
+    // An alerting failure must not suppress the log line or propagate.
+  }
+}
+
 export class StructuredLogger implements Logger {
   constructor(
     private readonly id = "indexer",
@@ -263,6 +306,7 @@ export class StructuredLogger implements Logger {
     if (shouldLog(logKey("error", message))) {
       recordErrorMetric("error", message, args);
       this.write("error", message, args);
+      runErrorHook(message, args, this.bindings);
     }
   }
 
