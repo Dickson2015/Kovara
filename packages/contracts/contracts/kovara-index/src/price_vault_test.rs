@@ -1,6 +1,15 @@
 //! Tests for PriceVault contract (CT-002, CT-003, CT-004, CT-005).
+//!
+//! Covers:
+//! - Submission round-trips including the new `item_name` field
+//! - `VerificationStatus` and `RewardStatus` lifecycle (default values, admin
+//!   transitions, `verified_ids` index, non-admin rejection)
+//! - All original CT-002..CT-005 cases (id sequencing, key determinism, country
+//!   and category validation, price bounds, schema versioning, authorization)
 
-use crate::price_vault::{Error, PriceVault, PriceVaultClient};
+use crate::price_vault::{
+    Error, PriceVault, PriceVaultClient, RewardStatus, VerificationStatus,
+};
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::testutils::Events;
 use soroban_sdk::testutils::Ledger as _;
@@ -37,6 +46,7 @@ fn deploy_initialized() -> Fixture<'static> {
     f
 }
 
+// Symbol constants shared across tests
 const US: Symbol = symbol_short!("US");
 const NG: Symbol = symbol_short!("NG");
 const KE: Symbol = symbol_short!("KE");
@@ -50,6 +60,14 @@ const INVALID_CAT: Symbol = symbol_short!("Invalid");
 const USD: Symbol = symbol_short!("USD");
 const NGN: Symbol = symbol_short!("NGN");
 
+// item_name constants
+const BREAD: Symbol = symbol_short!("Bread");
+const RICE: Symbol = symbol_short!("Rice");
+const BR1_CTR: Symbol = symbol_short!("1BR_CTR");
+const MON_PASS: Symbol = symbol_short!("MonPass");
+const ELECTRICITY: Symbol = symbol_short!("Elec");
+const GP_VISIT: Symbol = symbol_short!("GPVisit");
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CT-002 — Implement PriceVault
 // ═══════════════════════════════════════════════════════════════════════════
@@ -59,7 +77,9 @@ const NGN: Symbol = symbol_short!("NGN");
 fn a_submission_can_be_submitted_and_retrieved() {
     let f = deploy_initialized();
 
-    let id = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
 
     let submission = f.client.try_get_submission(&id).unwrap().unwrap();
 
@@ -67,6 +87,7 @@ fn a_submission_can_be_submitted_and_retrieved() {
     assert_eq!(submission.submitter, f.submitter);
     assert_eq!(submission.country_iso, US);
     assert_eq!(submission.category, FOOD);
+    assert_eq!(submission.item_name, BREAD);
     assert_eq!(submission.price_usd_cents, 100);
     assert_eq!(submission.currency_local, USD);
     assert_eq!(submission.price_local, 100);
@@ -77,9 +98,15 @@ fn a_submission_can_be_submitted_and_retrieved() {
 fn submissions_get_sequential_ids() {
     let f = deploy_initialized();
 
-    let id1 = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
-    let id2 = f.client.submit(&f.submitter, &US, &RENT, &200, &USD, &200);
-    let id3 = f.client.submit(&f.submitter, &NG, &FOOD, &300, &NGN, &50000);
+    let id1 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+    let id2 = f
+        .client
+        .submit(&f.submitter, &US, &RENT, &BR1_CTR, &200, &USD, &200);
+    let id3 = f
+        .client
+        .submit(&f.submitter, &NG, &FOOD, &RICE, &300, &NGN, &50000);
 
     assert_eq!(id1, 0);
     assert_eq!(id2, 1);
@@ -93,10 +120,12 @@ fn submission_count_increments() {
 
     assert_eq!(f.client.submission_count(), 0);
 
-    f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
+    f.client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
     assert_eq!(f.client.submission_count(), 1);
 
-    f.client.submit(&f.submitter, &US, &RENT, &200, &USD, &200);
+    f.client
+        .submit(&f.submitter, &US, &RENT, &BR1_CTR, &200, &USD, &200);
     assert_eq!(f.client.submission_count(), 2);
 }
 
@@ -106,7 +135,8 @@ fn a_rejected_submission_does_not_increment_counter() {
     let f = deploy_initialized();
 
     assert_eq!(
-        f.client.try_submit(&f.submitter, &ZZ, &FOOD, &100, &USD, &100),
+        f.client
+            .try_submit(&f.submitter, &ZZ, &FOOD, &BREAD, &100, &USD, &100),
         Err(Ok(Error::InvalidCountry))
     );
     assert_eq!(f.client.submission_count(), 0);
@@ -117,7 +147,8 @@ fn a_rejected_submission_does_not_increment_counter() {
 fn the_event_carries_every_required_field() {
     let f = deploy_initialized();
 
-    f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
+    f.client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
 
     let events = f.env.events().all();
     assert_eq!(events.events().len(), 1);
@@ -139,9 +170,12 @@ fn getting_a_nonexistent_submission_returns_not_found() {
 fn pending_submissions_are_returned_for_a_country() {
     let f = deploy_initialized();
 
-    f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
-    f.client.submit(&f.submitter, &US, &RENT, &200, &USD, &200);
-    f.client.submit(&f.submitter, &NG, &FOOD, &300, &NGN, &50000);
+    f.client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+    f.client
+        .submit(&f.submitter, &US, &RENT, &BR1_CTR, &200, &USD, &200);
+    f.client
+        .submit(&f.submitter, &NG, &FOOD, &RICE, &300, &NGN, &50000);
 
     let us_pending = f.client.pending(&US);
     assert_eq!(us_pending.len(), 2);
@@ -154,6 +188,367 @@ fn pending_submissions_are_returned_for_a_country() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// item_name field
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The item_name field is persisted and returned correctly.
+#[test]
+fn item_name_is_stored_and_returned() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &250, &USD, &250);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.item_name, BREAD);
+}
+
+/// Different item names in the same category produce distinct submissions.
+#[test]
+fn different_item_names_produce_different_submissions() {
+    let f = deploy_initialized();
+
+    let id1 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+    let id2 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &RICE, &100, &USD, &100);
+
+    assert_ne!(id1, id2);
+
+    let s1 = f.client.try_get_submission(&id1).unwrap().unwrap();
+    let s2 = f.client.try_get_submission(&id2).unwrap().unwrap();
+
+    assert_eq!(s1.item_name, BREAD);
+    assert_eq!(s2.item_name, RICE);
+}
+
+/// All basket category item names are accepted.
+#[test]
+fn basket_item_names_across_categories_are_accepted() {
+    let f = deploy_initialized();
+
+    let cases = [
+        (&US, &FOOD, &BREAD),
+        (&US, &RENT, &BR1_CTR),
+        (&US, &TRANSPORT, &MON_PASS),
+        (&US, &UTILITIES, &ELECTRICITY),
+        (&US, &HEALTH, &GP_VISIT),
+    ];
+
+    for (country, cat, item) in cases {
+        let id = f
+            .client
+            .submit(&f.submitter, country, cat, item, &100, &USD, &100);
+        let s = f.client.try_get_submission(&id).unwrap().unwrap();
+        assert_eq!(s.item_name, *item);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VerificationStatus — default values and transitions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// New submissions start with VerificationStatus::Pending.
+#[test]
+fn new_submissions_start_as_pending() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.verification_status, VerificationStatus::Pending);
+}
+
+/// Admin can transition a submission to Verified.
+#[test]
+fn admin_can_verify_a_submission() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    f.client
+        .set_verification_status(&f.admin, &id, &VerificationStatus::Verified);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.verification_status, VerificationStatus::Verified);
+}
+
+/// Admin can transition a submission to Rejected.
+#[test]
+fn admin_can_reject_a_submission() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    f.client
+        .set_verification_status(&f.admin, &id, &VerificationStatus::Rejected);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.verification_status, VerificationStatus::Rejected);
+}
+
+/// Verifying a submission appends it to the VerifiedSubmissions index.
+#[test]
+fn verifying_appends_to_verified_ids_index() {
+    let f = deploy_initialized();
+
+    let id1 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+    let id2 = f
+        .client
+        .submit(&f.submitter, &US, &RENT, &BR1_CTR, &200, &USD, &200);
+
+    // Only verify id1
+    f.client
+        .set_verification_status(&f.admin, &id1, &VerificationStatus::Verified);
+
+    let verified = f.client.verified_ids(&US);
+    assert_eq!(verified.len(), 1);
+    assert_eq!(verified.get(0).unwrap(), id1);
+
+    // Verify id2 as well
+    f.client
+        .set_verification_status(&f.admin, &id2, &VerificationStatus::Verified);
+
+    let verified = f.client.verified_ids(&US);
+    assert_eq!(verified.len(), 2);
+}
+
+/// Rejecting a submission does NOT append it to the verified index.
+#[test]
+fn rejecting_does_not_append_to_verified_ids() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    f.client
+        .set_verification_status(&f.admin, &id, &VerificationStatus::Rejected);
+
+    let verified = f.client.verified_ids(&US);
+    assert_eq!(verified.len(), 0);
+}
+
+/// Non-admin cannot change verification status.
+#[test]
+fn non_admin_cannot_change_verification_status() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    let stranger = Address::generate(&f.env);
+
+    assert_eq!(
+        f.client.try_set_verification_status(
+            &stranger,
+            &id,
+            &VerificationStatus::Verified
+        ),
+        Err(Ok(Error::NotAdmin))
+    );
+}
+
+/// set_verification_status on a missing ID returns NotFound.
+#[test]
+fn set_verification_status_on_missing_id_returns_not_found() {
+    let f = deploy_initialized();
+
+    assert_eq!(
+        f.client.try_set_verification_status(
+            &f.admin,
+            &999,
+            &VerificationStatus::Verified
+        ),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+/// Verification status change emits a VerificationStatusChanged event.
+#[test]
+fn verification_status_change_emits_event() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    // set_verification_status is its own top-level invocation; the harness
+    // captures only the events produced during *that* call.
+    f.client
+        .set_verification_status(&f.admin, &id, &VerificationStatus::Verified);
+
+    // The most recent invocation (set_verification_status) should have emitted
+    // exactly one event: VerificationStatusChanged.
+    let events = f.env.events().all();
+    assert_eq!(
+        events.events().len(),
+        1,
+        "expected exactly one VerificationStatusChanged event"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RewardStatus — default values and transitions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// New submissions start with RewardStatus::Unpaid.
+#[test]
+fn new_submissions_start_as_unpaid() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.reward_status, RewardStatus::Unpaid);
+}
+
+/// Admin can mark a submission as Paid.
+#[test]
+fn admin_can_mark_submission_as_paid() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    f.client
+        .set_reward_status(&f.admin, &id, &RewardStatus::Paid);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.reward_status, RewardStatus::Paid);
+}
+
+/// Admin can mark a submission as Ineligible.
+#[test]
+fn admin_can_mark_submission_as_ineligible() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    f.client
+        .set_reward_status(&f.admin, &id, &RewardStatus::Ineligible);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.reward_status, RewardStatus::Ineligible);
+}
+
+/// Non-admin cannot change reward status.
+#[test]
+fn non_admin_cannot_change_reward_status() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    let stranger = Address::generate(&f.env);
+
+    assert_eq!(
+        f.client
+            .try_set_reward_status(&stranger, &id, &RewardStatus::Paid),
+        Err(Ok(Error::NotAdmin))
+    );
+}
+
+/// set_reward_status on a missing ID returns NotFound.
+#[test]
+fn set_reward_status_on_missing_id_returns_not_found() {
+    let f = deploy_initialized();
+
+    assert_eq!(
+        f.client
+            .try_set_reward_status(&f.admin, &999, &RewardStatus::Paid),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+/// Reward status change emits a RewardStatusChanged event.
+#[test]
+fn reward_status_change_emits_event() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    // set_reward_status is its own top-level invocation; the harness
+    // captures only the events produced during *that* call.
+    f.client
+        .set_reward_status(&f.admin, &id, &RewardStatus::Paid);
+
+    // The most recent invocation (set_reward_status) should have emitted
+    // exactly one event: RewardStatusChanged.
+    let events = f.env.events().all();
+    assert_eq!(
+        events.events().len(),
+        1,
+        "expected exactly one RewardStatusChanged event"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Status fields persist through both storage copies
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Status mutations are visible on the record returned by get_submission.
+#[test]
+fn status_mutations_are_reflected_in_get_submission() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    f.client
+        .set_verification_status(&f.admin, &id, &VerificationStatus::Verified);
+    f.client
+        .set_reward_status(&f.admin, &id, &RewardStatus::Paid);
+
+    let submission = f.client.try_get_submission(&id).unwrap().unwrap();
+    assert_eq!(submission.verification_status, VerificationStatus::Verified);
+    assert_eq!(submission.reward_status, RewardStatus::Paid);
+}
+
+/// Status mutations are reflected in the pending() result for the country.
+#[test]
+fn status_mutations_are_reflected_in_pending_list() {
+    let f = deploy_initialized();
+
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+
+    f.client
+        .set_verification_status(&f.admin, &id, &VerificationStatus::Verified);
+
+    let pending = f.client.pending(&US);
+    // Submission still appears in the pending list (list is not filtered by
+    // status — callers filter on their side); but its status is updated.
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending.get(0).unwrap().verification_status,
+        VerificationStatus::Verified
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CT-003 — Key price submissions deterministically
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -163,19 +558,22 @@ fn pending_submissions_are_returned_for_a_country() {
 fn different_timestamps_produce_different_submissions() {
     let f = deploy_initialized();
 
-    let id1 = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
+    let id1 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
 
     // Advance the ledger timestamp
     f.env.ledger().set_timestamp(1000);
 
-    let id2 = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
+    let id2 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
 
     assert_ne!(id1, id2);
 
     let sub1 = f.client.try_get_submission(&id1).unwrap().unwrap();
     let sub2 = f.client.try_get_submission(&id2).unwrap().unwrap();
 
-    // Same values but different timestamps
     assert_eq!(sub1.country_iso, sub2.country_iso);
     assert_eq!(sub1.category, sub2.category);
     assert_eq!(sub1.price_usd_cents, sub2.price_usd_cents);
@@ -189,8 +587,12 @@ fn different_submitters_produce_different_submissions() {
 
     let submitter2 = Address::generate(&f.env);
 
-    let id1 = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
-    let id2 = f.client.submit(&submitter2, &US, &FOOD, &100, &USD, &100);
+    let id1 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+    let id2 = f
+        .client
+        .submit(&submitter2, &US, &FOOD, &BREAD, &100, &USD, &100);
 
     assert_ne!(id1, id2);
 }
@@ -200,8 +602,12 @@ fn different_submitters_produce_different_submissions() {
 fn different_countries_produce_different_submissions() {
     let f = deploy_initialized();
 
-    let id1 = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
-    let id2 = f.client.submit(&f.submitter, &NG, &FOOD, &100, &USD, &100);
+    let id1 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+    let id2 = f
+        .client
+        .submit(&f.submitter, &NG, &FOOD, &BREAD, &100, &USD, &100);
 
     assert_ne!(id1, id2);
 }
@@ -211,8 +617,12 @@ fn different_countries_produce_different_submissions() {
 fn different_categories_produce_different_submissions() {
     let f = deploy_initialized();
 
-    let id1 = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
-    let id2 = f.client.submit(&f.submitter, &US, &RENT, &100, &USD, &100);
+    let id1 = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
+    let id2 = f
+        .client
+        .submit(&f.submitter, &US, &RENT, &BR1_CTR, &100, &USD, &100);
 
     assert_ne!(id1, id2);
 }
@@ -227,7 +637,8 @@ fn an_invalid_country_code_is_rejected() {
     let f = deploy_initialized();
 
     assert_eq!(
-        f.client.try_submit(&f.submitter, &ZZ, &FOOD, &100, &USD, &100),
+        f.client
+            .try_submit(&f.submitter, &ZZ, &FOOD, &BREAD, &100, &USD, &100),
         Err(Ok(Error::InvalidCountry))
     );
 }
@@ -237,16 +648,19 @@ fn an_invalid_country_code_is_rejected() {
 fn valid_country_codes_are_accepted() {
     let f = deploy_initialized();
 
-    // US
-    let id = f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
     assert!(f.client.try_get_submission(&id).is_ok());
 
-    // NG
-    let id = f.client.submit(&f.submitter, &NG, &FOOD, &100, &NGN, &50000);
+    let id = f
+        .client
+        .submit(&f.submitter, &NG, &FOOD, &RICE, &100, &NGN, &50000);
     assert!(f.client.try_get_submission(&id).is_ok());
 
-    // KE
-    let id = f.client.submit(&f.submitter, &KE, &FOOD, &100, &USD, &100);
+    let id = f
+        .client
+        .submit(&f.submitter, &KE, &FOOD, &BREAD, &100, &USD, &100);
     assert!(f.client.try_get_submission(&id).is_ok());
 }
 
@@ -256,7 +670,15 @@ fn an_invalid_category_is_rejected() {
     let f = deploy_initialized();
 
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &INVALID_CAT, &100, &USD, &100),
+        f.client.try_submit(
+            &f.submitter,
+            &US,
+            &INVALID_CAT,
+            &BREAD,
+            &100,
+            &USD,
+            &100
+        ),
         Err(Ok(Error::InvalidCategory))
     );
 }
@@ -266,16 +688,18 @@ fn an_invalid_category_is_rejected() {
 fn all_valid_categories_are_accepted() {
     let f = deploy_initialized();
 
-    let categories = [
-        (FOOD, "Food"),
-        (RENT, "Rent"),
-        (TRANSPORT, "Transport"),
-        (UTILITIES, "Utilities"),
-        (HEALTH, "Health"),
+    let cases = [
+        (FOOD, BREAD),
+        (RENT, BR1_CTR),
+        (TRANSPORT, MON_PASS),
+        (UTILITIES, ELECTRICITY),
+        (HEALTH, GP_VISIT),
     ];
 
-    for (cat, _name) in categories {
-        let id = f.client.submit(&f.submitter, &US, &cat, &100, &USD, &100);
+    for (cat, item) in cases {
+        let id = f
+            .client
+            .submit(&f.submitter, &US, &cat, &item, &100, &USD, &100);
         assert!(f.client.try_get_submission(&id).is_ok());
     }
 }
@@ -287,7 +711,7 @@ fn a_rejected_submission_stores_nothing() {
 
     assert!(f
         .client
-        .try_submit(&f.submitter, &ZZ, &FOOD, &100, &USD, &100)
+        .try_submit(&f.submitter, &ZZ, &FOOD, &BREAD, &100, &USD, &100)
         .is_err());
 
     assert_eq!(f.client.submission_count(), 0);
@@ -304,7 +728,8 @@ fn a_zero_usd_price_is_rejected() {
     let f = deploy_initialized();
 
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &FOOD, &0, &USD, &100),
+        f.client
+            .try_submit(&f.submitter, &US, &FOOD, &BREAD, &0, &USD, &100),
         Err(Ok(Error::ZeroPrice))
     );
 }
@@ -315,7 +740,8 @@ fn a_zero_local_price_is_rejected() {
     let f = deploy_initialized();
 
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &FOOD, &100, &USD, &0),
+        f.client
+            .try_submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &0),
         Err(Ok(Error::ZeroPrice))
     );
 }
@@ -326,7 +752,8 @@ fn both_prices_zero_is_rejected() {
     let f = deploy_initialized();
 
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &FOOD, &0, &USD, &0),
+        f.client
+            .try_submit(&f.submitter, &US, &FOOD, &BREAD, &0, &USD, &0),
         Err(Ok(Error::ZeroPrice))
     );
 }
@@ -336,15 +763,29 @@ fn both_prices_zero_is_rejected() {
 fn prices_that_are_too_large_are_rejected() {
     let f = deploy_initialized();
 
-    // USD price too large
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &FOOD, &1_000_000_001, &USD, &100),
+        f.client.try_submit(
+            &f.submitter,
+            &US,
+            &FOOD,
+            &BREAD,
+            &1_000_000_001,
+            &USD,
+            &100
+        ),
         Err(Ok(Error::PriceTooLarge))
     );
 
-    // Local price too large
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &FOOD, &100, &USD, &1_000_000_001),
+        f.client.try_submit(
+            &f.submitter,
+            &US,
+            &FOOD,
+            &BREAD,
+            &100,
+            &USD,
+            &1_000_000_001
+        ),
         Err(Ok(Error::PriceTooLarge))
     );
 }
@@ -354,8 +795,15 @@ fn prices_that_are_too_large_are_rejected() {
 fn boundary_prices_are_accepted() {
     let f = deploy_initialized();
 
-    // Maximum allowed price
-    let id = f.client.submit(&f.submitter, &US, &FOOD, &1_000_000_000, &USD, &1_000_000_000);
+    let id = f.client.submit(
+        &f.submitter,
+        &US,
+        &FOOD,
+        &BREAD,
+        &1_000_000_000,
+        &USD,
+        &1_000_000_000,
+    );
     let submission = f.client.try_get_submission(&id).unwrap().unwrap();
     assert_eq!(submission.price_usd_cents, 1_000_000_000);
     assert_eq!(submission.price_local, 1_000_000_000);
@@ -366,7 +814,9 @@ fn boundary_prices_are_accepted() {
 fn minimum_valid_price_is_accepted() {
     let f = deploy_initialized();
 
-    let id = f.client.submit(&f.submitter, &US, &FOOD, &1, &USD, &1);
+    let id = f
+        .client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &1, &USD, &1);
     let submission = f.client.try_get_submission(&id).unwrap().unwrap();
     assert_eq!(submission.price_usd_cents, 1);
     assert_eq!(submission.price_local, 1);
@@ -379,7 +829,7 @@ fn a_rejected_price_does_not_emit_an_event() {
 
     assert!(f
         .client
-        .try_submit(&f.submitter, &US, &FOOD, &0, &USD, &100)
+        .try_submit(&f.submitter, &US, &FOOD, &BREAD, &0, &USD, &100)
         .is_err());
 
     assert_eq!(f.env.events().all().events().len(), 0);
@@ -426,7 +876,8 @@ fn operations_are_rejected_before_initialization() {
     let f = deploy();
 
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &FOOD, &100, &USD, &100),
+        f.client
+            .try_submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100),
         Err(Ok(Error::NotInitialized))
     );
 
@@ -441,7 +892,6 @@ fn operations_are_rejected_before_initialization() {
 fn an_incompatible_schema_is_rejected() {
     let f = deploy_initialized();
 
-    // Simulate a different schema version
     f.env.as_contract(&f.client.address, || {
         f.env
             .storage()
@@ -451,7 +901,8 @@ fn an_incompatible_schema_is_rejected() {
 
     assert!(!f.client.is_schema_compatible());
     assert_eq!(
-        f.client.try_submit(&f.submitter, &US, &FOOD, &100, &USD, &100),
+        f.client
+            .try_submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100),
         Err(Ok(Error::IncompatibleSchema))
     );
 }
@@ -468,5 +919,6 @@ fn an_unsigned_submission_is_rejected() {
 
     f.env.set_auths(&[]);
 
-    f.client.submit(&f.submitter, &US, &FOOD, &100, &USD, &100);
+    f.client
+        .submit(&f.submitter, &US, &FOOD, &BREAD, &100, &USD, &100);
 }
