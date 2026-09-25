@@ -5,6 +5,7 @@ import rateLimit, { RateLimitRequestHandler } from "express-rate-limit";
 import crypto from "crypto";
 import { Database } from "../db";
 import { ApiErrorResponse, DebugSnapshot } from "./contracts";
+import { logger } from "../logger";
 import pkg from "../../package.json";
 import {
   addressRateLimiter,
@@ -472,9 +473,22 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
   app.use(
     (err: Error, req: Request, res: Response<ApiErrorResponse>, _next: NextFunction): void => {
       const correlationId = req.correlationId;
-      console.error(`[${correlationId}]`, err);
+      const databaseRelated = isDatabaseError(err);
 
-      if (isDatabaseError(err)) {
+      // Report through the structured logger instead of a raw console.error, so
+      // the failure carries redaction, dedup and the correlation id. When
+      // alerting is configured (#683) the logger hook turns this line into an
+      // alert, so database outages page as critical.
+      const log = logger.child({ correlationId, surface: "http" });
+      log.error("unhandled_request_error", {
+        err,
+        method: req.method,
+        path: req.path,
+        databaseRelated,
+        alertSeverity: databaseRelated ? "critical" : "error",
+      });
+
+      if (databaseRelated) {
         res.status(503).json({
           error: "Database unavailable",
           code: "DATABASE_UNAVAILABLE",

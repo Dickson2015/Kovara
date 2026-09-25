@@ -21,6 +21,18 @@
  *   ENABLE_RATE_LIMITING   - (optional) Enable rate limiting middleware (default: true)
  *   ENABLE_EXPERIMENTAL_ROUTES - (optional) Enable experimental routes (e.g., pools) (default: false)
  *   FILTER_EVENTS              - (optional) Comma-separated list of event types to index (e.g. post_created,like). When unset, all event types are streamed.
+ *
+ * Production alerting (#683) - all optional; alerting is inert unless a sink is
+ * configured, so leaving these unset preserves existing behaviour:
+ *   SENTRY_DSN                 - (optional) Sentry DSN; enables the Sentry sink
+ *   ALERT_WEBHOOK_URL          - (optional) HTTP(S) URL to POST alerts to (Slack, PagerDuty, ...)
+ *   ALERT_SEVERITY_THRESHOLD   - (optional) critical | error | warning (default: error)
+ *   ALERT_IGNORE_CODES         - (optional) Comma-separated error codes that never alert
+ *   ALERT_DEDUP_WINDOW_MS      - (optional) Suppress repeats of one failure for this long (default: 300000)
+ *   ALERT_MAX_PER_WINDOW       - (optional) Max alerts delivered per window (default: 20)
+ *   ALERT_RATE_LIMIT_WINDOW_MS - (optional) Delivery-budget window (default: 60000)
+ *   ALERT_SAMPLE_RATE          - (optional) Fraction of alerts delivered, 0-1 (default: 1)
+ *   ALERT_SINK_TIMEOUT_MS      - (optional) Per-sink timeout (default: 5000)
  */
 import { Pool } from "pg";
 import { streamEvents, EventHandler, RawEvent } from "./stream";
@@ -30,6 +42,13 @@ import { PostgresDatabase } from "./db";
 import { EventStore } from "./event-store";
 import { withRetry } from "./retry";
 import { logger } from "./logger";
+import {
+  alertManager,
+  installLoggerAlerting,
+  loadAlertingConfig,
+  sentrySinkFromDsn,
+  WebhookSink,
+} from "./alerting";
 import { randomUUID } from "crypto";
 import { ConfigError, IndexerConfig, loadConfig, parseStartLedger } from "./config";
 import pkg from "../package.json";
@@ -421,7 +440,51 @@ async function handleEvent(event: RawEvent, db: PostgresDatabase): Promise<void>
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Configure production alerting (#683).
+ *
+ * Alerting is opt-in and inert until a sink is configured, so a deployment that
+ * sets none of these variables behaves exactly as before. Sinks are registered
+ * before the logger hook so no `logger.error` line can be emitted unobserved,
+ * and an unusable DSN or webhook URL is skipped rather than thrown - a bad
+ * alerting setting must never stop the indexer from booting.
+ */
+function configureAlerting(): void {
+  alertManager.configure(loadAlertingConfig());
+
+  const sentry = sentrySinkFromDsn(process.env.SENTRY_DSN);
+  if (sentry) {
+    alertManager.addSink(sentry);
+    logger.info("alerting_sentry_enabled");
+  }
+
+  const webhookUrl = process.env.ALERT_WEBHOOK_URL;
+  if (webhookUrl) {
+    try {
+      new URL(webhookUrl);
+      alertManager.addSink(new WebhookSink(webhookUrl));
+      logger.info("alerting_webhook_enabled");
+    } catch {
+      logger.warn("alerting_webhook_url_invalid", { reason: "not a valid URL" });
+    }
+  }
+
+  if (alertManager.enabled) {
+    // Route every existing logger.error site into the alerting pipeline.
+    installLoggerAlerting(alertManager);
+    const config = alertManager.getConfig();
+    logger.info("alerting_enabled", {
+      severityThreshold: config.severityThreshold,
+      maxAlertsPerWindow: config.maxAlertsPerWindow,
+      dedupWindowMs: config.dedupWindowMs,
+    });
+  } else {
+    logger.info("alerting_disabled", { reason: "no SENTRY_DSN or ALERT_WEBHOOK_URL" });
+  }
+}
+
 async function main(): Promise<void> {
+  configureAlerting();
   const replayStartLedger = process.env["REPLAY_START_LEDGER"];
   const replayEndLedger = process.env["REPLAY_END_LEDGER"];
 
@@ -585,6 +648,9 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  // A boot failure is the most critical thing this process can report, so it is
+  // always delivered regardless of the severity threshold.
+  alertManager.capture("critical", "indexer failed to start", err, { phase: "boot" });
   logger.error("Fatal error:", err);
   process.exit(1);
 });
