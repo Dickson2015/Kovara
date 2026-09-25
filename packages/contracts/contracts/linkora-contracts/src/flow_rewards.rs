@@ -8,7 +8,7 @@
 /// produce named `ContractError` variants on overflow/underflow (CT-022).
 use soroban_sdk::{contractevent, contractimpl, panic_with_error, symbol_short, token, Address, Env, Symbol};
 
-use crate::{ContractError, KovaraContract, RewardRole, StorageKey};
+use crate::{ContractError, KovaraContract, RewardAssetConfig, RewardRole, StorageKey};
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -200,6 +200,26 @@ impl KovaraContract {
         .publish(&env);
     }
 
+    pub fn set_supported_reward_assets(env: Env, xlm: Address, usdc: Address) {
+        Self::require_initialized(&env);
+        Self::require_admin(&env);
+
+        env.storage().persistent().set(
+            &StorageKey::RewardAssets,
+            &RewardAssetConfig { xlm, usdc },
+        );
+        Self::bump(&env, &StorageKey::RewardAssets);
+    }
+
+    pub fn get_supported_reward_assets(env: Env) -> Option<RewardAssetConfig> {
+        Self::require_initialized(&env);
+        let config: Option<RewardAssetConfig> = env.storage().persistent().get(&StorageKey::RewardAssets);
+        if config.is_some() {
+            Self::bump(&env, &StorageKey::RewardAssets);
+        }
+        config
+    }
+
     pub fn get_reward_liability(env: Env, token: Address) -> i128 {
         Self::require_initialized(&env);
         Self::get_reward_liability_internal(&env, &token)
@@ -293,6 +313,18 @@ impl KovaraContract {
         if *token == env.current_contract_address() {
             panic_with_error!(env, ContractError::InvalidRewardAsset);
         }
+
+        if let Some(config) = env
+            .storage()
+            .persistent()
+            .get::<_, RewardAssetConfig>(&StorageKey::RewardAssets)
+        {
+            let matches_supported = *token == config.xlm || *token == config.usdc;
+            if !matches_supported {
+                panic_with_error!(env, ContractError::InvalidRewardAsset);
+            }
+        }
+
         // Verify the token is a valid SEP-41 asset by calling balance().
         token::Client::new(env, token).balance(&env.current_contract_address());
     }
